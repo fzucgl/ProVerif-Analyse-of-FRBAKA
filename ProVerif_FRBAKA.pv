@@ -1,0 +1,380 @@
+(******************************************************************************)
+(*  ProVerif Model for the FRBAKA Protocol                                   *)
+(*  (Fast Resilient Batch Authentication and Key Agreement)                  *)
+(*                                                                            *)
+(*  Models: GCS, UAV, and IoT devices with PUF-based authentication         *)
+(******************************************************************************)
+
+(* ========================================================================== *)
+(*                           1. BASIC DEFINITIONS                             *)
+(* ========================================================================== *)
+
+free c: channel.
+
+(* ------------------- Types ------------------- *)
+type id.         (* Permanent Identities: uid_v, did_i *)
+type tid.        (* Temporary Identities: TUID_v, TDID_i *)
+type key.        (* Keys: k_g, sk, sk_i *)
+type nonce.      (* Random Nonces: ND_i *)
+type timestamp.  (* Timestamps: T_g, T_u *)
+type data.       (* Sensor Data: Data_i *)
+type hash.       (* Hash values *)
+type challenge.  (* PUF Challenge: c^t *)
+type response.   (* PUF Response: r_v^t, r_i^t *)
+
+(* ------------------- Cryptographic Functions ------------------- *)
+
+(* One-way hash function h() *)
+fun h(bitstring): hash.
+
+(* Hash to key conversion *)
+fun hash_to_key(hash): key [typeConverter].
+
+(* Symmetric encryption/decryption *)
+fun senc(bitstring, key): bitstring.
+reduc forall m: bitstring, k: key; sdec(senc(m, k), k) = m.
+
+(* Bitwise XOR operation - Fixed version *)
+fun xor(bitstring, bitstring): bitstring.
+(* Essential XOR property: (x ⊕ y) ⊕ y = x *)
+equation forall x: bitstring, y: bitstring; xor(xor(x, y), y) = x.
+(* Reverse order property: (y ⊕ x) ⊕ x = y *)
+equation forall x: bitstring, y: bitstring; xor(xor(y, x), x) = y.
+
+(* Physical Unclonable Function PUF() *)
+(* For UAV: PUF_u(c^t) = r_v^t *)
+fun puf_uav(challenge): response [private].
+(* For Device: PUF_{d_i}(c^t) = r_i^t *)
+fun puf_dev(id, challenge): response [private].
+
+(* Helper functions for type conversion *)
+fun id_to_bitstring(id): bitstring [data, typeConverter].
+fun tid_to_bitstring(tid): bitstring [data, typeConverter].
+fun timestamp_to_bitstring(timestamp): bitstring [data, typeConverter].
+fun data_to_bitstring(data): bitstring [data, typeConverter].
+fun nonce_to_bitstring(nonce): bitstring [data, typeConverter].
+fun hash_to_bitstring(hash): bitstring [data, typeConverter].
+fun key_to_bitstring(key): bitstring [data, typeConverter].
+fun challenge_to_bitstring(challenge): bitstring [data, typeConverter].
+fun response_to_bitstring(response): bitstring [data, typeConverter].
+
+fun bitstring_to_data(bitstring): data [typeConverter].
+fun bitstring_to_id(bitstring): id [typeConverter].
+fun bitstring_to_nonce(bitstring): nonce [typeConverter].
+
+(* ------------------- Security Goals Declarations ------------------- *)
+
+free k_g_secret: key [private].
+free sk_secret: key [private].
+free sk_i_secret: key [private].
+free did_secret: id [private].
+free sensor_data_secret: data [private].
+free response_uav_secret: response [private].
+free response_dev_secret: response [private].
+
+query attacker(k_g_secret).
+query attacker(sk_secret).
+query attacker(sk_i_secret).
+query attacker(did_secret).
+query attacker(sensor_data_secret).
+query attacker(response_uav_secret).
+query attacker(response_dev_secret).
+
+(* ------------------- Event Declarations for Authentication ------------------- *)
+
+event GCS_Sends_MSG1(tid, tid).
+event UAV_Receives_MSG1(tid).
+event UAV_Sends_MSG2(tid, tid).
+event Dev_Receives_MSG2(tid, tid).
+event Dev_Auth_UAV(tid, tid).
+event Dev_Sends_MSG3(tid, tid).
+event UAV_Receives_MSG3(tid, tid).
+event UAV_Auth_Dev(tid, tid).
+event UAV_Sends_MSG4(tid).
+event GCS_Receives_MSG4(tid, tid).
+event GCS_Conf_Data(tid, tid).
+
+(* Authentication Queries *)
+(* Strong authentication: Device authenticates UAV *)
+query u:tid, d:tid;
+      inj-event(Dev_Auth_UAV(d,u)) ==> inj-event(UAV_Sends_MSG2(u,d)).
+
+(* Strong authentication: UAV authenticates Device *)
+query u:tid, d:tid;
+      inj-event(UAV_Auth_Dev(u,d)) ==> inj-event(Dev_Sends_MSG3(d,u)).
+
+(* End-to-end authentication: GCS Conf data from Device *)
+query u:tid, d:tid;
+      inj-event(GCS_Conf_Data(u,d)) ==> inj-event(Dev_Sends_MSG3(d,u)).
+
+(* ========================================================================== *)
+(*                            2. PROCESS DEFINITIONS                          *)
+(* ========================================================================== *)
+
+(* ------------------- IoT Device Process (D_i) ------------------- *)
+let processDevice(did: id, tdid: tid, ct: challenge) =
+    (* Step B3: Receive MSG_{2_i} from UAV *)
+    (* MSG_{2_i} = {TDID_i, T_g, c^t, pa_i, pb_i, pc_i, M_{2_i}} *)
+    in(c, (tdid_r: tid, tg_r: timestamp, ct_r: challenge, 
+           pa_i_r: bitstring, pb_i_r: bitstring, pc_i_r: bitstring, m2_i_r: hash));
+
+    event Dev_Receives_MSG2(tdid, tdid_r);
+
+    (* Verify temporary identity TDID_i - important for rollback mechanism *)
+    if tdid_r = tdid then
+
+    (* Verify integrity: recompute M_{2_i}^* = h(c^t || pa_i || pb_i || T_g || did_i) *)
+    let m2_i_star = h((challenge_to_bitstring(ct_r), pa_i_r, pb_i_r, 
+                       timestamp_to_bitstring(tg_r), id_to_bitstring(did))) in
+    
+    if m2_i_star = m2_i_r then
+
+    (* Device generates PUF response: r_i^t = PUF_{d_i}(c^t) *)
+    let r_i_t = puf_dev(did, ct_r) in
+
+    (* Compute verification parameter: pc_i^* = h(r_i^t || T_g) *)
+    let pc_i_star = h((response_to_bitstring(r_i_t), timestamp_to_bitstring(tg_r))) in
+
+    (* Verify pc_i^* == pc_i (authenticates the UAV/GCS) *)
+    if hash_to_bitstring(pc_i_star) = pc_i_r then
+
+    (* Compute session key: sk_i = pa_i ⊕ h(did_i || r_i^t || T_g) *)
+    let h_val = h((id_to_bitstring(did), response_to_bitstring(r_i_t), 
+                   timestamp_to_bitstring(tg_r))) in
+    let sk_i_bitstring = xor(pa_i_r, hash_to_bitstring(h_val)) in
+    let sk_i = hash_to_key(h(sk_i_bitstring)) in
+
+    (* Authentication successful *)
+    event Dev_Auth_UAV(tdid, tdid_r);
+
+    (* ===== Step C1: Prepare MSG_3 ===== *)
+    
+    (* Generate fresh nonce ND_i *)
+    new ndi: nonce;
+    
+    (* Collect sensor data *)
+    new sensor_data: data;
+
+    (* Compute pd_i = h(r_i^t ⊕ pb_i || ND_i) *)
+    let r_xor_pb = xor(response_to_bitstring(r_i_t), pb_i_r) in
+    let pd_i = h((r_xor_pb, nonce_to_bitstring(ndi))) in
+
+    (* Compute new temporary identity: TDID_i^{new} = h(TDID_i || T_g || did_i || r_i^t) *)
+    let tdid_new = h((tid_to_bitstring(tdid), timestamp_to_bitstring(tg_r), 
+                      id_to_bitstring(did), response_to_bitstring(r_i_t))) in
+
+    (* Compute message authentication code: M_{4_i} = h(TDID_i || ND_i || did_i || Data_i) *)
+    let m4_i = h((tid_to_bitstring(tdid), nonce_to_bitstring(ndi), 
+                  id_to_bitstring(did), data_to_bitstring(sensor_data))) in
+
+    (* Encrypt data: {Data_i}_{sk_i} *)
+    let enc_data = senc((data_to_bitstring(sensor_data), id_to_bitstring(did)), sk_i) in
+
+    (* Send MSG_{3_i} = {ND_i, pd_i, M_{4_i}, {Data_i}_{sk_i}} *)
+    event Dev_Sends_MSG3(tdid, tdid_r);
+    out(c, (ndi, pd_i, m4_i, enc_data)).
+
+
+(* ------------------- UAV Process (U_v) ------------------- *)
+let processUAV(uid: id, tuid: tid, ct: challenge) =
+    (* ===== Step B2: Receive MSG_1 from GCS ===== *)
+    (* MSG_1 = {TUID_v, c^t, pu, T_g, TDID_i, pa_i, pb_i, M_{2_i}, M_3} *)
+    in(c, (tuid_r: tid, ct_r: challenge, pu_r: bitstring, tg_r: timestamp,
+           tdid_i: tid, pa_i: bitstring, pb_i: bitstring, m2_i: hash, m3_r: hash));
+
+    (* Verify temporary identity TUID_v - important for rollback mechanism *)
+    if tuid_r = tuid then
+
+    (* Verify integrity: recompute M_3^* *)
+    (* M_3 includes all parameters to ensure integrity of MSG_1 *)
+    let m3_star = h((tid_to_bitstring(tuid_r), challenge_to_bitstring(ct_r), pu_r,
+                     timestamp_to_bitstring(tg_r), id_to_bitstring(uid),
+                     tid_to_bitstring(tdid_i), pa_i, pb_i, hash_to_bitstring(m2_i))) in
+
+    if m3_star = m3_r then
+
+    event UAV_Receives_MSG1(tuid);
+
+    (* UAV generates PUF response: r_v^t = PUF_u(c^t) *)
+    let r_v_t = puf_uav(ct_r) in
+
+    (* Compute session key: sk = pu ⊕ h(uid_v || r_v^t || T_g) *)
+    let h_uav = h((id_to_bitstring(uid), response_to_bitstring(r_v_t), 
+                   timestamp_to_bitstring(tg_r))) in
+    let sk_bitstring = xor(pu_r, hash_to_bitstring(h_uav)) in
+    let sk = hash_to_key(h(sk_bitstring)) in
+
+    (* Compute verification parameter: pc_i = h(r_v^t ⊕ pb_i || T_g) *)
+    let r_xor_pb = xor(response_to_bitstring(r_v_t), pb_i) in
+    let pc_i = h((r_xor_pb, timestamp_to_bitstring(tg_r))) in
+
+    (* Send MSG_{2_i} to device: {TDID_i, T_g, c^t, pa_i, pb_i, pc_i, M_{2_i}} *)
+    event UAV_Sends_MSG2(tuid, tdid_i);
+    out(c, (tdid_i, tg_r, ct_r, pa_i, pb_i, hash_to_bitstring(pc_i), m2_i));
+
+    (* ===== Step C2: Receive MSG_3 from device ===== *)
+    (* MSG_{3_i} = {ND_i, pd_i, M_{4_i}, {Data_i}_{sk_i}} *)
+    in(c, (ndi_r: nonce, pd_i_r: hash, m4_i_r: hash, enc_data_r: bitstring));
+
+    (* Verify pd_i: compute pd_i^* = h(r_v^t || ND_i) *)
+    let pd_i_star = h((response_to_bitstring(r_v_t), nonce_to_bitstring(ndi_r))) in
+
+    if pd_i_star = pd_i_r then
+
+    event UAV_Receives_MSG3(tuid, tdid_i);
+    event UAV_Auth_Dev(tuid, tdid_i);
+
+    (* Generate new timestamp T_u *)
+    new tu: timestamp;
+
+    (* Compute new temporary identity: TUID_v^{new} = h(TUID_v || T_g || uid_v || r_v^t) *)
+    let tuid_new = h((tid_to_bitstring(tuid), timestamp_to_bitstring(tg_r),
+                      id_to_bitstring(uid), response_to_bitstring(r_v_t))) in
+
+    (* Prepare MSG_3 content for aggregation *)
+    let msg3_content = (nonce_to_bitstring(ndi_r), hash_to_bitstring(pd_i_r),
+                        hash_to_bitstring(m4_i_r), enc_data_r) in
+
+    (* Compute aggregate verification: M_5 = h(TUID_v || T_u || uid_v || {MSG_3}) *)
+    let m5 = h((tid_to_bitstring(tuid), timestamp_to_bitstring(tu),
+                id_to_bitstring(uid), msg3_content)) in
+
+    (* Encrypt aggregated messages: {MSG_3}_{sk} *)
+    let enc_msg3 = senc(msg3_content, sk) in
+
+    (* Send MSG_4 = {T_u, M_5, {MSG_3}_{sk}} *)
+    event UAV_Sends_MSG4(tuid);
+    out(c, (tuid, tu, m5, enc_msg3)).
+
+
+(* ------------------- GCS Process ------------------- *)
+let processGCS(k_g: key, uid: id, tuid: tid, did: id, tdid: tid, ct: challenge,
+               r_v_t: response, r_i_t: response) =
+    
+    (* ===== Step B1: Generate MSG_1 ===== *)
+    
+    (* Generate fresh timestamp T_g *)
+    new tg: timestamp;
+
+    (* Compute UAV session key: sk = h(k_g || T_g || r_v^t) *)
+    let sk_hash = h((key_to_bitstring(k_g), timestamp_to_bitstring(tg),
+                     response_to_bitstring(r_v_t))) in
+    let sk = hash_to_key(sk_hash) in
+
+    (* Compute public value: pu = sk ⊕ h(uid_v || r_v^t || T_g) *)
+    let h_val = h((id_to_bitstring(uid), response_to_bitstring(r_v_t),
+                   timestamp_to_bitstring(tg))) in
+    let pu = xor(key_to_bitstring(sk), hash_to_bitstring(h_val)) in
+
+    (* For device D_i: *)
+    (* Compute device session key: sk_i = h(k_g || T_g || r_i^t) *)
+    let sk_i_hash = h((key_to_bitstring(k_g), timestamp_to_bitstring(tg),
+                       response_to_bitstring(r_i_t))) in
+    let sk_i = hash_to_key(sk_i_hash) in
+
+    (* Compute pa_i = sk_i ⊕ h(did_i || r_i^t || T_g) *)
+    let h_dev = h((id_to_bitstring(did), response_to_bitstring(r_i_t),
+                   timestamp_to_bitstring(tg))) in
+    let pa_i = xor(key_to_bitstring(sk_i), hash_to_bitstring(h_dev)) in
+
+    (* Compute pb_i = r_v^t ⊕ r_i^t *)
+    let pb_i = xor(response_to_bitstring(r_v_t), response_to_bitstring(r_i_t)) in
+
+    (* Compute authentication message: M_{2_i} = h(c^t || pa_i || pb_i || T_g || did_i) *)
+    let m2_i = h((challenge_to_bitstring(ct), pa_i, pb_i,
+                  timestamp_to_bitstring(tg), id_to_bitstring(did))) in
+
+    (* Compute comprehensive verification message M_3 *)
+    let m3 = h((tid_to_bitstring(tuid), challenge_to_bitstring(ct), pu,
+                timestamp_to_bitstring(tg), id_to_bitstring(uid),
+                tid_to_bitstring(tdid), pa_i, pb_i, hash_to_bitstring(m2_i))) in
+
+    (* Send MSG_1 = {TUID_v, c^t, pu, T_g, TDID_i, pa_i, pb_i, M_{2_i}, M_3} *)
+    event GCS_Sends_MSG1(tuid, tdid);
+    out(c, (tuid, ct, pu, tg, tdid, pa_i, pb_i, m2_i, m3));
+
+    (* ===== Step C3: Receive MSG_4 from UAV ===== *)
+    (* MSG_4 = {TUID_v, T_u, M_5, {MSG_3}_{sk}} *)
+    in(c, (tuid_r: tid, tu_r: timestamp, m5_r: hash, enc_msg3_r: bitstring));
+
+    (* Verify it's the expected UAV *)
+    if tuid_r = tuid then
+
+    (* Decrypt MSG_3 using sk *)
+    let (ndi_dec: bitstring, pd_i_dec: bitstring, m4_i_dec: bitstring, 
+         enc_data_dec: bitstring) = sdec(enc_msg3_r, sk) in
+
+    (* Reconstruct MSG_3 content *)
+    let msg3_content_star = (ndi_dec, pd_i_dec, m4_i_dec, enc_data_dec) in
+
+    (* Verify M_5: compute M_5^* = h(TUID_v || T_u || uid_v || {MSG_3}) *)
+    let m5_star = h((tid_to_bitstring(tuid), timestamp_to_bitstring(tu_r),
+                     id_to_bitstring(uid), msg3_content_star)) in
+
+    if m5_star = m5_r then
+
+    event GCS_Receives_MSG4(tuid, tdid);
+
+    (* Decrypt sensor data using sk_i *)
+    let (data_dec: bitstring, did_dec: bitstring) = sdec(enc_data_dec, sk_i) in
+
+    (* Convert nonce back *)
+    let ndi_final = bitstring_to_nonce(ndi_dec) in
+
+    (* Verify M_{4_i}: compute M_{4_i}^* = h(TDID_i || ND_i || did_i || Data_i) *)
+    let m4_i_star = h((tid_to_bitstring(tdid), nonce_to_bitstring(ndi_final),
+                       id_to_bitstring(did), data_dec)) in
+
+    if h(m4_i_dec) = m4_i_star then
+
+    (* All verifications successful - data is authentic *)
+    event GCS_Conf_Data(tuid, tdid);
+    
+    (* Update temporary identities (implicit in the model) *)
+    (* TUID_v^{new} = h(TUID_v || T_g || uid_v || r_v^t) *)
+    (* TDID_i^{new} = h(TDID_i || T_g || did_i || r_i^t) *)
+    (* Retire used CRP (c^t, r_v^t) and (c^t, r_i^t) *)
+    
+    0.
+
+
+(* ========================================================================== *)
+(*                               3. MAIN PROCESS                              *)
+(* ========================================================================== *)
+
+process
+    (* ===== System Initialization (Step A1) ===== *)
+    
+    (* 1. Generate system-wide master key k_g *)
+    new k_g: key;
+
+    (* 2. Create UAV identity *)
+    new uid: id;
+    new tuid: tid;  (* Initial temporary identity *)
+
+    (* 3. Create device identity *)
+    new did: id;
+    new tdid: tid;  (* Initial temporary identity *)
+
+    (* 4. Generate unique PUF challenge c^t *)
+    new ct: challenge;
+
+    (* ===== Registration Phase (Step A2) ===== *)
+    (* Simulate the CRP generation during registration *)
+    (* UAV generates response: r_v^t = PUF_u(c^t) *)
+    let r_v_t = puf_uav(ct) in
+    (* Device generates response: r_i^t = PUF_{d_i}(c^t) *)
+    let r_i_t = puf_dev(did, ct) in
+    (* GCS stores the CRP: (c^t, r_v^t) for UAV and (c^t, r_i^t) for device *)
+
+    (* ===== Protocol Execution ===== *)
+    (
+        (* GCS process - initiates the protocol *)
+        processGCS(k_g, uid, tuid, did, tdid, ct, r_v_t, r_i_t)
+        |
+        (* UAV process - intermediary *)
+        processUAV(uid, tuid, ct)
+        |
+        (* Device process - data source *)
+        processDevice(did, tdid, ct)
+    )
